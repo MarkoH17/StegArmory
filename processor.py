@@ -101,25 +101,13 @@ class LSBProcessor(Processor):
     
     def extractData(self, payloadSavePath):
         dec_payload_bits = self._lsb_extract(self.src_img_pixels)
-
-        #payload_bin = struct.pack('i', int(dec_payload_bits[::-1], base=2))
-        payload_bytes = int(dec_payload_bits, 2).to_bytes(len(dec_payload_bits) // 8, 'big')
-
-        payload_bytes = payload_bytes.split(LSBProcessor.delimeter)[0]
-
+        payload_bytes = np.ndarray.tobytes(np.packbits(dec_payload_bits)).split(LSBProcessor.delimeter)[0]
         with open(payloadSavePath, 'wb') as file:
             file.write(payload_bytes)
           
-    
     def _lsb_extract(self, pixel_array):
-        payload_bits = ""
-        for i in range(self.height): # X axis
-            for j in range(self.width): # Y axis
-                for k in range(3): #RGB Index
-                    pixel_val = self.src_img_pixels[i][j][k]
-                    pixel_val_lsb = pixel_val & 1
-                    payload_bits += str(pixel_val_lsb)
-        return payload_bits
+        lsb_extractor = np.vectorize(lambda p : p & 1, otypes=[np.uint8])
+        return lsb_extractor(pixel_array)
 
     def compare(self, Image):
         pass

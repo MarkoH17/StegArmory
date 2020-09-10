@@ -139,7 +139,7 @@ class LSBProcessor(Processor):
             print("-----------------------")
             print(f"Steg Method: {StegMethod(self.header['method']).name}")
             print(f"Embed Channels: {StegMethodChannel(self.header['image_channels']).name}")
-            print(f"Payload Size: {util.human_readable_size(self.header['payload_size'], 2)}")
+            print(f"Payload Size: {util.human_readable_size(self.header['payload_size'] // 8, 2)}")
             print(f"Payload Checksum: {hex(self.header['payload_checksum'])}")
             print("-----------------------")
         print("")

@@ -1,6 +1,4 @@
-import numpy as np
 import processor
-import time
 
 def main():
 

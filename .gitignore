@@ -2,3 +2,5 @@
 .vscode/
 __pycache__/
 images/backup/
+images/output.png
+payloads/extracted_output

@@ -1,28 +1,24 @@
 import numpy as np
-from PIL import Image
-import processor as Processor
-
+import processor
+import time
 
 def main():
+
     print("Welcome to StegArmory!")
     
-    src_image = "images/car.png"
-    dst_image = "images/output.png"
-    payload = "payloads/meterpreter.exe"
-
-    payloadOut = "payloads/testextract"
+    src_image_path = "images/panels.png"
+    dst_image_path = "images/output.png"
     
-    lP = Processor.LSBProcessor(src_image)
-    lP.getInfo()
-
-
-    lP.embedData(payload, dst_image) 
+    payload_path = "payloads/doc.pdf"
+    extraction_output_path = "payloads/extracted_output"
     
-
-    lP2 = Processor.LSBProcessor(dst_image)
-    lP2.getInfo()
-
-    lP2.extractData(payloadOut)
+    lP = processor.LSBProcessor(src_image_path)
+    lP.get_info()
+    lP.embed_payload(payload_path, dst_image_path)
+       
+    lP2 = processor.LSBProcessor(dst_image_path)
+    lP2.get_info()
+    lP2.extract_payload(extraction_output_path)
 
 if __name__ == "__main__":
     main()

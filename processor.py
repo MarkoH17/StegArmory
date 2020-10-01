@@ -127,14 +127,7 @@ class LSBProcessor(Processor):
          
         self._lsb_embed(enc_pixels, complete_payload)
 
-        if self.has_alpha:
-            enc_pixels = cv2.cvtColor(enc_pixels, cv2.COLOR_RGBA2BGRA)
-        else:
-            enc_pixels = cv2.cvtColor(enc_pixels, cv2.COLOR_RGB2BGR)
-
-        cv2.imwrite(dst_image, enc_pixels, [cv2.IMWRITE_PNG_COMPRESSION, 9])
-
-        print("Successfully embedded payload in cover image")
+        global_save_img_from_pixels(self, enc_pixels, dst_image)
 
     def extract_payload(self, payload_save_path):
         img_header = self._get_header()
@@ -170,22 +163,197 @@ class LSBProcessor(Processor):
 
 class PVDProcessor(Processor):
 
+    
+
     def __init__(self, src_image_path):
         global_init(self, src_image_path)
 
     def _get_header(self):
-        pass
+        header_stop_pixel = self._pvd_get_header_boundary(self.src_img_pixels)
+
+        image_header_bits = self._pvd_extract(self.src_img_pixels, 0, header_stop_pixel, 128)
+        header_magic_bits = image_header_bits[:40]
+
+        if not np.array_equal(np.packbits(header_magic_bits), np.frombuffer(np.array(["SAMRH"], dtype='|S5'), dtype='uint8')):
+            print("WARN: This image has not been processed with StegArmory!")
+            return       
+        
+        header_method_bits = image_header_bits[40:48]
+        header_method = np.frombuffer(np.packbits(header_method_bits), dtype='uint8')[0]
+
+        header_image_channels_bits = image_header_bits[48:56]
+        header_image_channels = np.frombuffer(np.packbits(header_image_channels_bits), dtype='uint8')[0]
+        
+        header_payload_size_bits = image_header_bits[56:88]
+        header_payload_size = np.frombuffer(np.packbits(header_payload_size_bits), dtype='uint32')[0]
+
+
+        header_payload_checksum_bits = image_header_bits[88:120]
+        header_payload_checksum = np.frombuffer(np.packbits(header_payload_checksum_bits), dtype='uint32')[0]
+
+        x = {
+            "method": header_method,
+            "image_channels": header_image_channels,
+            "payload_size": header_payload_size,
+            "payload_checksum": header_payload_checksum
+        }
+
+        return x
+    
+    def _get_payload_chunk(self, start, count, payload_bits):
+        packed_bits = np.packbits(payload_bits[0:4][::-1])
+
+        return int.from_bytes(np.ndarray.tobytes(packed_bits), byteorder='little')
+
+    def _calc_new_pixel_pair(self, pixels, m_val, new_diff, orig_diff):
+        pixel_a = pixels[0]
+        pixel_b = pixels[1]
+        
+        if pixel_a >= pixel_b and new_diff > orig_diff:
+            pixels = [
+                    pixel_a + math.ceil(m_val / 2),
+                    pixel_b - math.floor(m_val / 2)
+                ]
+        elif pixel_a < pixel_b and new_diff > orig_diff:
+            pixels = [
+                    pixel_a - math.ceil(m_val / 2),
+                    pixel_b + math.floor(m_val / 2)
+                ]
+        elif pixel_a >= pixel_b and new_diff <= orig_diff:
+            pixels = [
+                    pixel_a - math.ceil(m_val / 2),
+                    pixel_b + math.floor(m_val / 2)
+                ]
+        elif pixel_a < pixel_b and new_diff <= orig_diff:
+            pixels = [
+                    pixel_a + math.ceil(m_val / 2),
+                    pixel_b - math.floor(m_val / 2)
+                ]
+        
+        return np.floor(pixels).astype('int32').tolist()
+
+
+    def _get_range_keys(self, pixel_difference):
+        wu_tsai_ranges = [
+            list(range(0, 7 + 1)),
+            list(range(8, 15 + 1)),
+            list(range(16, 31 + 1)),
+            list(range(32, 63 + 1)),
+            list(range(64, 127 + 1)),
+            list(range(128, 255 + 1))
+        ]
+
+        for sub_range in wu_tsai_ranges:
+            if pixel_difference in sub_range:
+                return [sub_range[0], sub_range[-1]] #Return first and last value in range      
+
+    def _pvd_get_header_boundary(self, enc_pixels):
+        embed_space = 0
+        pixel_array = self.src_img_pixels.flatten()
+        
+        for i in range(0, pixel_array.size - 1, 2):
+            if embed_space >= 128:
+                return i # Returns index aka number of pixels needed to retrieve header
+
+            pixel_pair = pixel_array[i:i+2]
+            range_keys = self._get_range_keys(abs(int(pixel_pair[1]) - int(pixel_pair[0])))
+            t_val = math.floor(math.log2(range_keys[1] - range_keys[0])) # Number of bits to embed
+            embed_space += t_val
+            
+
+
+    def _pvd_calculate_space(self):
+        embed_space = 0
+        pixel_array = self.src_img_pixels.flatten()
+        
+        for i in range(0, pixel_array.size - 1, 2):
+            pixel_pair = pixel_array[i:i+2]
+            range_keys = self._get_range_keys(abs(int(pixel_pair[1]) - int(pixel_pair[0])))
+            t_val = math.floor(math.log2(range_keys[1] - range_keys[0])) # Number of bits to embed
+            embed_space += t_val
+
+        return embed_space
+
 
     def _pvd_embed(self, pixel_array, payload_bits):
+        #x1 = self._pvd_calculate_space()
+                
+        pixel_array_enc = np.copy(pixel_array)
+        
         req_pixel_space = len(payload_bits)
-
         pixel_array = pixel_array.flatten()
 
-        for i in range(pixel_array.size - 1):
-            pixel_a = pixel_array[i]
-            pixel_b = pixel_array[i + 1]
+        payload_bit_index = 0
 
-            pixel_diff = abs(pixel_b - pixel_a)
+        for i in range(0, pixel_array.size - 1, 2):
+            pixel_pair = pixel_array[i:i+2]
+            pixel_diff = abs(int(pixel_pair[1]) - int(pixel_pair[0]))
+
+            range_keys = self._get_range_keys(pixel_diff)
+            t_val = math.floor(math.log2(range_keys[1] - range_keys[0])) # Number of bits to embed
+
+            bits_to_embed = payload_bits[payload_bit_index:payload_bit_index+t_val]
+
+            if len(bits_to_embed) < t_val:
+                bits_to_embed = np.pad(bits_to_embed, mode='constant', pad_width=(0, t_val - len(bits_to_embed)))
+
+            bits_packed = np.packbits(bits_to_embed[::-1], bitorder='little')
+            bits_decimal_val = int.from_bytes(np.ndarray.tobytes(bits_packed), byteorder='little')
+
+            #new_diff = range_keys[0] + (bits_decimal_val * 2)
+            new_diff = range_keys[0] + bits_decimal_val
+
+            range_keys_new = self._get_range_keys(new_diff)
+            
+            if not np.equal(range_keys, range_keys_new).all():
+                print("Out of range!")
+                return
+            
+            m_val = abs(new_diff - pixel_diff)
+
+            pixel_pair_new = self._calc_new_pixel_pair(pixel_pair, m_val, new_diff, pixel_diff)
+
+                        
+            pixel_array[i] = pixel_pair_new[0]
+            pixel_array[i+1] = pixel_pair_new[1]
+
+            payload_bit_index += len(bits_to_embed)
+
+            print("(%d, %d) embed %s and becomes (%s)" % (self.src_img_pixels.flatten()[i], self.src_img_pixels.flatten()[i+1], str(bits_to_embed), str(pixel_pair_new)))
+
+            if payload_bit_index >= req_pixel_space:
+                print("Done?")
+                break
+        return pixel_array
+
+    def _pvd_extract(self, enc_pixels, pixel_start_index, pixel_stop_index, bits_to_extract):
+        payload = []
+
+        enc_pixels = enc_pixels.flatten()
+
+
+        for i in range(pixel_start_index, pixel_stop_index, 2):
+            if len(payload) >= bits_to_extract:
+                return payload
+
+            pixel_pair = enc_pixels[i:i+2]
+
+            pixel_diff = abs(int(pixel_pair[1]) - int(pixel_pair[0]))
+
+            range_keys = self._get_range_keys(pixel_diff)
+            
+            b_val = pixel_diff - range_keys[0] # Diff - Lower Val
+            t_val = math.floor(math.log2(range_keys[1] - range_keys[0]))
+            #bits_extracted = np.unpackbits(np.array([b_val // 2], dtype=np.uint8))[-t_val:].tolist()
+            bits_extracted = np.unpackbits(np.array([b_val], dtype=np.uint8))[-t_val:].tolist()
+
+            if len(bits_extracted) < t_val:
+                bits_extracted = np.pad(bits_to_embed, mode='constant', pad_width=(0, t_val - len(bits_extracted)))
+
+            print("(%s) extracted %s" % (str(pixel_pair), str(bits_extracted)))
+
+            payload.extend(bits_extracted)
+        return payload            
 
     def get_info(self):
         print(f"\nImage ({self.src_img_path})")
@@ -228,20 +396,39 @@ class PVDProcessor(Processor):
         header_bits = global_gen_header(StegMethod.PVD, StegMethodChannel.RGB, req_pixel_space, payload_checksum)
         complete_payload = np.concatenate((header_bits, payload_bits))
 
-        self._pvd_embed(enc_pixels, complete_payload)
+        enc_pixels = self._pvd_embed(enc_pixels, complete_payload)
 
-        if self.has_alpha:
-            enc_pixels = cv2.cvtColor(enc_pixels, cv2.COLOR_RGBA2BGRA)
-        else:
-            enc_pixels = cv2.cvtColor(enc_pixels, cv2.COLOR_RGB2BGR)
+        enc_pixels = np.reshape(enc_pixels, self.src_img_pixels.shape)
 
-        cv2.imwrite(dst_image, enc_pixels, [cv2.IMWRITE_PNG_COMPRESSION, 9])
-
-        print("Successfully embedded payload in cover image")
+        global_save_img_from_pixels(self, enc_pixels, dst_image)
 
 
     def extract_payload(self, payload_save_path):
-        pass
+        # Need some way to get header without knowing where it stops?
+        
+        if self.header is None:
+            print("ERROR: Missing embedded header in image! Cannot extract payload.")
+            return
+
+        header_payload_size = self.header["payload_size"]
+        header_payload_checksum = self.header["payload_checksum"]
+
+        print(f"Extracting {util.human_readable_size(header_payload_size // 8, 2)} payload from the image") 
+
+        header_stop_pixel = self._pvd_get_header_boundary(self.src_img_pixels)
+
+        dec_payload_bits = self._pvd_extract(self.src_img_pixels, header_stop_pixel, self.src_img_pixels.size - 1, header_payload_size)[:header_payload_size]
+        payload_bytes = np.ndarray.tobytes(np.packbits(dec_payload_bits))
+        payload_checksum = binascii.crc32(payload_bytes)
+
+        if payload_checksum != header_payload_checksum:
+            print("ERROR: Failed to verify payload checksum!")
+            return
+        
+        with open(payload_save_path, 'wb') as file:
+            file.write(payload_bytes)      
+        
+        print(f"Successfully extracted payload and saved to {payload_save_path}")
     
     def compare(self, Image):
         pass
@@ -271,3 +458,13 @@ def global_gen_header(method, image_channels, payload_size, payload_checksum):
     header_data_bits = np.unpackbits(np.frombuffer(header_data, dtype="uint8", count=header_data.nbytes))
 
     return header_data_bits
+
+def global_save_img_from_pixels(self, pixels, save_path):
+    if self.has_alpha:
+        pixels = cv2.cvtColor(pixels, cv2.COLOR_RGBA2BGRA)
+    else:
+        pixels = cv2.cvtColor(pixels, cv2.COLOR_RGB2BGR)
+
+    cv2.imwrite(save_path, pixels, [cv2.IMWRITE_PNG_COMPRESSION, 9])
+
+    print("Successfully embedded payload in cover image")

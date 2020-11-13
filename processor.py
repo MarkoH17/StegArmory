@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from enum import Enum
 import numpy as np
 import skimage.metrics
-import cv2, util, binascii, math, imutils, sys
+import cv2, util, binascii, math, imutils, sys, logging
 
 class Processor(ABC):
     @abstractmethod
@@ -50,12 +50,13 @@ class LSBProcessor(Processor):
         self.max_payload_size = self.total_pixels * 3
 
     def _get_header(self):
+        self.logger.debug("Getting image header")
         image_header_bits = self.lsb_extractor(self.src_img_pixels.flatten()[:128]) #Extract the first 128 bits (16 bytes) for the header
         
         header_magic_bits = image_header_bits[:40]
         
         if not np.array_equal(np.packbits(header_magic_bits), np.frombuffer(np.array(["SAMRH"], dtype='|S5'), dtype='uint8')):
-            print("WARN: This image has not been processed with StegArmory!")
+            self.logger.warn("This image has not been processed with StegArmory!")
             return       
         
         header_method_bits = image_header_bits[40:48]
@@ -89,22 +90,24 @@ class LSBProcessor(Processor):
 
         
     def get_info(self):
-        print(f"\nImage ({self.src_img_path})")
-        print("-----------------------")
-        print(f"Transparency: {self.has_alpha}")
-        print(f"Total Pixels: {self.total_pixels}")
-        print(f"Max Payload Size: {util.human_readable_size(self.max_payload_size // 8, 2)}")
-        print("-----------------------")
+        image_info = ""
+        image_info += f"\nImage ({self.src_img_path})"
+        image_info += "\n-----------------------"
+        image_info += f"\nTransparency: {self.has_alpha}"
+        image_info += f"\nTotal Pixels: {self.total_pixels}"
+        image_info += f"\nMax Payload Size: {util.human_readable_size(self.max_payload_size // 8, 2)}"
+        image_info += "\n-----------------------"
         
         if self.header is not None:
-            print(f"\nEmbedded Header ({self.src_img_path})")
-            print("-----------------------")
-            print(f"Steg Method: {StegMethod(self.header['method']).name}")
-            print(f"Embed Channels: {StegMethodChannel(self.header['image_channels']).name}")
-            print(f"Payload Size: {util.human_readable_size(self.header['payload_size'] // 8, 2)}")
-            print(f"Payload Checksum: {hex(self.header['payload_checksum'])}")
-            print("-----------------------")
-        print("")
+            image_info += f"\nEmbedded Header ({self.src_img_path})"
+            image_info += "\n-----------------------"
+            image_info += f"\nSteg Method: {StegMethod(self.header['method']).name}"
+            image_info += f"\nEmbed Channels: {StegMethodChannel(self.header['image_channels']).name}"
+            image_info += f"\nPayload Size: {util.human_readable_size(self.header['payload_size'] // 8, 2)}"
+            image_info += f"\nPayload Checksum: {hex(self.header['payload_checksum'])}"
+            image_info += "\n-----------------------\n"
+
+        self.logger.info(image_info)
 
     def embed_payload(self, payload, dst_image):
         enc_pixels = np.copy(self.src_img_pixels)
@@ -116,18 +119,17 @@ class LSBProcessor(Processor):
         payload_bits = np.unpackbits(np.frombuffer(payload_data, dtype="uint8", count=len(payload_data)))
         req_pixel_space = len(payload_bits)
 
-        print(f"Embedding {util.human_readable_size(req_pixel_space // 8, 2)} payload in the cover image")
+        self.logger.info(f"Embedding {util.human_readable_size(req_pixel_space // 8, 2)} payload in the cover image")
 
         if req_pixel_space > np.iinfo(np.uint32).max:
-            print(f"ERROR: Cannot embed files larger than {(np.iinfo(np.uint32).max // 8)} bytes")
-            #sys.exit(1)
-            return
+            self.logger.critical(f"Cannot embed payload larger than {(np.iinfo(np.uint32).max // 8)} bytes")
+            sys.exit(1)
 
         if req_pixel_space > (self.total_pixels * 3) or req_pixel_space == 0:
-            print("ERROR: Cannot embed this file in the cover image")
-            #sys.exit(1)
-            return
+            self.logger.critical("Cannot embed this payload in the cover image because it is too large")
+            sys.exit(1)
 
+        self.logger.info("Setting header during embed")
         header_bits = global_gen_header(StegMethod.LSB, StegMethodChannel.RGB, req_pixel_space, payload_checksum)
         complete_payload = np.concatenate((header_bits, payload_bits))
          
@@ -137,35 +139,35 @@ class LSBProcessor(Processor):
 
     def extract_payload(self, payload_save_path):
         if self.header is None:
-            print("ERROR: Missing embedded header in image! Cannot extract payload.")
-            #sys.exit(1)
-            return
+            self.logger.critical("Missing embedded header in image! Cannot extract payload.")
+            sys.exit(1)
 
         header_payload_size = self.header["payload_size"]
         header_payload_checksum = self.header["payload_checksum"]
 
-        print(f"Extracting {util.human_readable_size(header_payload_size // 8, 2)} payload from the image")
+        if self.max_payload_size < header_payload_size + 128 or header_payload_size < 1:
+            self.logger.critical("Invalid payload size specified in header")
+            sys.exit(1)
+            
+        self.logger.info(f"Extracting {util.human_readable_size(header_payload_size // 8, 2)} payload from the image")
 
-        if self.src_img_pixels.size < header_payload_size - 128:
-            print("ERROR: Invalid payload size specified in header")
-            #sys.exit(1)
-            return
-        
+
         dec_payload_bits = self.lsb_extractor((self.src_img_pixels.flatten())[128:header_payload_size+128])
         payload_bytes = np.ndarray.tobytes(np.packbits(dec_payload_bits))
         payload_checksum = binascii.crc32(payload_bytes)
 
         if payload_checksum != header_payload_checksum:
-            print("ERROR: Failed to verify payload checksum!")
-            #sys.exit(1)
-            return
+            self.logger.critical("Failed to verify checksum of extracted payload!")
+            sys.exit(1)
         
         with open(payload_save_path, 'wb') as file:
             file.write(payload_bytes)      
         
-        print(f"Successfully extracted payload and saved to {payload_save_path}")
+        self.logger.info(f"Successfully extracted payload and saved to {payload_save_path}")
     
     def compare(self, image):
+        self.logger.info("Comparing images for similarity and quality")
+
         colorA = cv2.cvtColor(self.src_img_pixels, cv2.COLOR_BGR2RGB)
         colorB = cv2.cvtColor(image.src_img_pixels, cv2.COLOR_BGR2RGB)
 
@@ -178,11 +180,12 @@ class LSBProcessor(Processor):
             "ssim": score    
         }
 
-        print("PSNR: " + str(round(psnr, 4)))
-        print("SSIM: " + str(round(score, 4)))
+        self.logger.debug("PSNR: " + str(round(psnr, 4)))
+        self.logger.debug("SSIM: " + str(round(score, 4)))
                 
 
     def visual_compare(self, image):
+        self.logger.info("Comparing images for visual similarity")
         grayA = cv2.cvtColor(self.src_img_pixels, cv2.COLOR_BGR2GRAY)
         grayB = cv2.cvtColor(image.src_img_pixels, cv2.COLOR_BGR2GRAY)
 
@@ -199,9 +202,7 @@ class LSBProcessor(Processor):
             cv2.drawContours(filled_after, [c], 0, (0,255,0), -1)
 
         cv2.imshow('filled after',filled_after)
-        cv2.waitKey(0)
-
-        
+        cv2.waitKey(0) 
 
 class PVDProcessor(Processor):
     def __init__(self, src_image_path):
@@ -210,13 +211,14 @@ class PVDProcessor(Processor):
         
 
     def _get_header(self):
+        self.logger.debug("Getting image header")
         header_stop_pixel = self._pvd_get_header_boundary(self.src_img_pixels)
 
         image_header_bits = self._pvd_extract(self.src_img_pixels, 0, header_stop_pixel[0], 128)
         header_magic_bits = image_header_bits[:40]
 
         if not np.array_equal(np.packbits(header_magic_bits), np.frombuffer(np.array(["SAMRH"], dtype='|S5'), dtype='uint8')):
-            print("WARN: This image has not been processed with StegArmory!")
+            self.logger.warn("This image has not been processed with StegArmory!")
             return       
         
         header_method_bits = image_header_bits[40:48]
@@ -261,33 +263,6 @@ class PVDProcessor(Processor):
         return np.floor(pixels).astype('int32').tolist()
 
     def _get_range_keys(self, pixel_difference):
-        '''
-        wu_tsai_ranges = [
-            list(range(0, 7 + 1)), #0-8
-            list(range(8, 15 + 1)), #8-16
-            list(range(16, 31 + 1)), #16-32
-            list(range(32, 63 + 1)), #32-64
-            list(range(64, 127 + 1)), #64 - 128
-            list(range(128, 255 + 1)) #128 - 256
-        ]
-        
-        wu_tsai_ranges = [
-            list(range(0, 1 + 1)),
-            list(range(2, 3 + 1)),
-            list(range(4, 7 + 1)),
-            list(range(8, 11 + 1)),
-            list(range(12, 15 + 1)),
-            list(range(16, 23 + 1)),
-            list(range(24, 31 + 1)),
-            list(range(32, 47 + 1)),
-            list(range(48, 63 + 1)),
-            list(range(64, 95 + 1)),
-            list(range(96, 127 + 1)),
-            list(range(128, 191 + 1)),
-            list(range(192, 255 + 1))
-        ]
-        '''
-
         wu_tsai_ranges = [
             [0, 1, 1],
             [2, 3, 1],
@@ -310,6 +285,7 @@ class PVDProcessor(Processor):
                 return sub_range
 
     def _pvd_get_header_boundary(self, enc_pixels):
+        self.logger.debug("Getting pixel boundary for header")
         embed_space = 0
         pixel_array = self.src_img_pixels.flatten()
         
@@ -329,6 +305,7 @@ class PVDProcessor(Processor):
             embed_space += t_val
     
     def _pvd_calculate_space(self):
+        self.logger.debug("Calculating maximum payload size")
         embed_space = 0
         pixel_array = self.src_img_pixels.flatten()
         
@@ -384,18 +361,6 @@ class PVDProcessor(Processor):
 
             payload_bit_index += len(bits_to_embed)
 
-            '''
-            print("(%d, %d) orig_diff (%d) embeds %s and becomes (%d, %d) new_diff (%d)" % (
-                self.src_img_pixels.flatten()[i],
-                self.src_img_pixels.flatten()[i+1],
-                pixel_diff,
-                str(bits_to_embed),
-                pixel_pair_new[0],
-                pixel_pair_new[1],
-                new_diff
-            ))
-            '''
-
             if payload_bit_index >= req_pixel_space:
                 break
 
@@ -427,38 +392,29 @@ class PVDProcessor(Processor):
                 bits_extracted = bits_extracted[bit_start_index:]
                 bit_start_index = 0
 
-            #if len(bits_extracted) < t_val:
-            #    bits_extracted = np.pad(bits_to_embed, mode='constant', pad_width=(0, t_val - len(bits_extracted)))
-
-            '''
-            print("(%d, %d) curr_diff (%d) extracts %s " % (
-                pixel_pair[0],
-                pixel_pair[1],
-                pixel_diff,
-                str(bits_extracted)
-            ))
-            '''
             payload.extend(bits_extracted)
 
         return payload            
 
     def get_info(self):
-        print(f"\nImage ({self.src_img_path})")
-        print("-----------------------")
-        print(f"Transparency: {self.has_alpha}")
-        print(f"Total Pixels: {self.total_pixels}")
-        print(f"Max Payload Size: {util.human_readable_size(self.max_payload_size // 8, 2)}")
-        print("-----------------------")
+        image_info = ""
+        image_info += f"\nImage ({self.src_img_path})"
+        image_info += "\n-----------------------"
+        image_info += f"\nTransparency: {self.has_alpha}"
+        image_info += f"\nTotal Pixels: {self.total_pixels}"
+        image_info += f"\nMax Payload Size: {util.human_readable_size(self.max_payload_size // 8, 2)}"
+        image_info += "\n-----------------------"
         
         if self.header is not None:
-            print(f"\nEmbedded Header ({self.src_img_path})")
-            print("-----------------------")
-            print(f"Steg Method: {StegMethod(self.header['method']).name}")
-            print(f"Embed Channels: {StegMethodChannel(self.header['image_channels']).name}")
-            print(f"Payload Size: {util.human_readable_size(self.header['payload_size'] // 8, 2)}")
-            print(f"Payload Checksum: {hex(self.header['payload_checksum'])}")
-            print("-----------------------")
-        print("")
+            image_info += f"\nEmbedded Header ({self.src_img_path})"
+            image_info += "\n-----------------------"
+            image_info += f"\nSteg Method: {StegMethod(self.header['method']).name}"
+            image_info += f"\nEmbed Channels: {StegMethodChannel(self.header['image_channels']).name}"
+            image_info += f"\nPayload Size: {util.human_readable_size(self.header['payload_size'] // 8, 2)}"
+            image_info += f"\nPayload Checksum: {hex(self.header['payload_checksum'])}"
+            image_info += "\n-----------------------\n"
+
+        self.logger.info(image_info)
 
     def embed_payload(self, payload, dst_image):
         enc_pixels = np.copy(self.src_img_pixels)
@@ -470,20 +426,18 @@ class PVDProcessor(Processor):
         payload_bits = np.unpackbits(np.frombuffer(payload_data, dtype="uint8", count=len(payload_data)))
         req_pixel_space = len(payload_bits)
 
-        print(f"Embedding {util.human_readable_size(req_pixel_space // 8, 2)} payload in the cover image")
+        self.logger.info(f"Embedding {util.human_readable_size(req_pixel_space // 8, 2)} payload in the cover image")
 
         if req_pixel_space > np.iinfo(np.uint32).max:
-            print(f"ERROR: Cannot embed files larger than {(np.iinfo(np.uint32).max // 8)} bytes")
-            #sys.exit(1)
-            return
+            self.logger.critical(f"Cannot embed payload larger than {(np.iinfo(np.uint32).max // 8)} bytes")
+            sys.exit(1)
         
         
         if req_pixel_space > self.max_payload_size:
-            print("ERROR: Cannot embed this file in the cover image")
-            #sys.exit(1)
-            return
+            self.logger.critical("Cannot embed this payload in the cover image because it is too large")
+            sys.exit(1)
         
-
+        self.logger.info("Setting header during embed")
         header_bits = global_gen_header(StegMethod.PVD, StegMethodChannel.RGB, req_pixel_space, payload_checksum)
         complete_payload = np.concatenate((header_bits, payload_bits))
 
@@ -495,14 +449,17 @@ class PVDProcessor(Processor):
 
     def extract_payload(self, payload_save_path):
         if self.header is None:
-            print("ERROR: Missing embedded header in image! Cannot extract payload.")
-            #sys.exit(1)
-            return
+            self.logger.critical("Missing embedded header in image! Cannot extract payload.")
+            sys.exit(1)
 
         header_payload_size = self.header["payload_size"]
         header_payload_checksum = self.header["payload_checksum"]
 
-        print(f"Extracting {util.human_readable_size(header_payload_size // 8, 2)} payload from the image") 
+        if self.max_payload_size < header_payload_size + 128 or header_payload_size < 1:
+            self.logger.critical("Invalid payload size specified in header")
+            sys.exit(1)
+
+        self.logger.info(f"Extracting {util.human_readable_size(header_payload_size // 8, 2)} payload from the image") 
 
         header_stop_pixel = self._pvd_get_header_boundary(self.src_img_pixels)
 
@@ -514,14 +471,13 @@ class PVDProcessor(Processor):
         payload_checksum = binascii.crc32(payload_bytes)
 
         if payload_checksum != header_payload_checksum:
-            print("ERROR: Failed to verify payload checksum!")
-            #sys.exit(1)
-            return
+            self.logger.critical("Failed to verify checksum of extracted payload!")
+            sys.exit(1)
         
         with open(payload_save_path, 'wb') as file:
             file.write(payload_bytes)      
         
-        print(f"Successfully extracted payload and saved to {payload_save_path}")
+        self.logger.info(f"Successfully extracted payload and saved to {payload_save_path}")
     
     def compare(self, image):
         colorA = cv2.cvtColor(self.src_img_pixels, cv2.COLOR_BGR2RGB)
@@ -536,8 +492,8 @@ class PVDProcessor(Processor):
             "ssim": score    
         }
 
-        print("PSNR: " + str(round(psnr, 4)))
-        print("SSIM: " + str(round(score, 4)))
+        self.logger.info("PSNR: " + str(round(psnr, 4)))
+        self.logger.info("SSIM: " + str(round(score, 4)))
                 
 
     def visual_compare(self, image):
@@ -559,8 +515,9 @@ class PVDProcessor(Processor):
         cv2.imshow('filled after',filled_after)
         cv2.waitKey(0)
 
-
 def global_init(self, src_image_path):
+    self.logger = logging.LoggerAdapter(logging.getLogger(), {"caller":self.__class__.__name__})
+    self.logger.debug("Performing global initialization of processor")
     self.src_img_path = src_image_path
     self.src_img = cv2.imread(src_image_path, cv2.IMREAD_UNCHANGED)
     self.has_alpha = len(self.src_img.shape) > 2 and self.src_img.shape[2] == 4
@@ -573,8 +530,6 @@ def global_init(self, src_image_path):
     self.comparison_stats = None
 
 def global_gen_header(method, image_channels, payload_size, payload_checksum):
-    print("Setting header during embed")
-
     header_magic = "SAMRH"                                  # Magic Bytes                                       [5 bytes]
     header_method = method.value                            # (refer to StegMethod enum values)                 [1 byte]
     header_image_channels = image_channels.value            # (refer to StegMethodChannel enum values)          [1 byte]
@@ -595,4 +550,4 @@ def global_save_img_from_pixels(self, pixels, save_path):
 
     cv2.imwrite(save_path, pixels)
 
-    print("Successfully embedded payload in cover image")
+    self.logger.info("Successfully embedded payload in cover image")

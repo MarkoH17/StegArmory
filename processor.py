@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from enum import Enum
+from tqdm import tqdm
 import numpy as np
 import skimage.metrics
 import cv2, util, binascii, math, imutils, sys, logging
@@ -43,14 +44,13 @@ class StegMethodChannel(Enum):
     RGBA = 32
 
 class LSBProcessor(Processor):
-    lsb_extractor = np.vectorize(lambda p : p & 1, otypes=[np.uint8])
 
     def __init__(self, src_image_path):
         global_init(self, src_image_path)
         self.max_payload_size = self.total_pixels * 3
 
     def _get_header(self):
-        self.logger.debug("Getting image header")
+        self.logger.info("Getting image header")
         image_header_bits = self.lsb_extractor(self.src_img_pixels.flatten()[:128]) #Extract the first 128 bits (16 bytes) for the header
         
         header_magic_bits = image_header_bits[:40]
@@ -80,15 +80,27 @@ class LSBProcessor(Processor):
         }
 
     def _lsb_embed(self, pixel_array, payload_bits):
+        self.logger.info("Embedding data:")
         req_pixel_space = len(payload_bits)
-        with np.nditer(pixel_array, op_flags=['readwrite'], flags=['c_index']) as iterator:
-            for pixel in iterator:
-                if iterator.index >= req_pixel_space:
-                    break
-                
-                pixel[...] = pixel & 0xFE | payload_bits[iterator.index]
+        with tqdm(total=req_pixel_space, file=sys.stdout) as prog_bar:
+            with np.nditer(pixel_array, op_flags=['readwrite'], flags=['c_index']) as iterator:
+                for pixel in iterator:
+                    if iterator.index >= req_pixel_space:
+                        break
+                    
+                    pixel[...] = pixel & 0xFE | payload_bits[iterator.index]
+                    prog_bar.update(1)
 
-        
+    def _lsb_extract(self, pixel_array, payload_size):
+        payload = []
+        self.logger.info("Extracting data:")
+        with tqdm(total=payload_size, file=sys.stdout) as prog_bar:
+            with np.nditer(pixel_array, flags=['c_index']) as iterator:
+                for pixel in iterator:
+                    payload.append(pixel & 1)
+                    prog_bar.update(1)
+        return payload
+
     def get_info(self):
         image_info = ""
         image_info += f"\nImage ({self.src_img_path})"
@@ -152,7 +164,9 @@ class LSBProcessor(Processor):
         self.logger.info(f"Extracting {util.human_readable_size(header_payload_size // 8, 2)} payload from the image")
 
 
-        dec_payload_bits = self.lsb_extractor((self.src_img_pixels.flatten())[128:header_payload_size+128])
+        #dec_payload_bits = self.lsb_extractor((self.src_img_pixels.flatten())[128:header_payload_size+128])
+        dec_payload_bits = self._lsb_extract((self.src_img_pixels.flatten())[128:header_payload_size+128], header_payload_size)
+        
         payload_bytes = np.ndarray.tobytes(np.packbits(dec_payload_bits))
         payload_checksum = binascii.crc32(payload_bytes)
 
@@ -180,8 +194,8 @@ class LSBProcessor(Processor):
             "ssim": score    
         }
 
-        self.logger.debug("PSNR: " + str(round(psnr, 4)))
-        self.logger.debug("SSIM: " + str(round(score, 4)))
+        self.logger.info("PSNR: " + str(round(psnr, 4)))
+        self.logger.info("SSIM: " + str(round(score, 4)))
                 
 
     def visual_compare(self, image):
@@ -207,11 +221,10 @@ class LSBProcessor(Processor):
 class PVDProcessor(Processor):
     def __init__(self, src_image_path):
         global_init(self, src_image_path)
-        self.max_payload_size = self._pvd_calculate_space()
         
 
     def _get_header(self):
-        self.logger.debug("Getting image header")
+        self.logger.info("Getting image header")
         header_stop_pixel = self._pvd_get_header_boundary(self.src_img_pixels)
 
         image_header_bits = self._pvd_extract(self.src_img_pixels, 0, header_stop_pixel[0], 128)
@@ -279,124 +292,145 @@ class PVDProcessor(Processor):
             [192, 255, 6]
         ]
 
-        
         for sub_range in wu_tsai_ranges:
             if sub_range[0] <= pixel_difference <= sub_range[1]: # If pixel_difference belongs to a subrange
                 return sub_range
 
     def _pvd_get_header_boundary(self, enc_pixels):
-        self.logger.debug("Getting pixel boundary for header")
+        self.logger.info("Finding header boundary:")
+
         embed_space = 0
         pixel_array = self.src_img_pixels.flatten()
-        
-        for i in range(0, pixel_array.size - 1, 2):
-            if embed_space >= 128:
-                return [i, t_val - (embed_space - 128)] # Returns index aka number of pixels needed to retrieve header
 
-            pixel_pair = pixel_array[i:i+2]
-            pixel_diff = int(pixel_pair[1]) - int(pixel_pair[0])
-            range_keys = self._get_range_keys(abs(pixel_diff))
+        with tqdm(total=128, file=sys.stdout) as prog_bar:
+            for i in range(0, pixel_array.size - 1, 2):
+                if embed_space >= 128:
+                    prog_bar.total = embed_space
+                    #prog_bar.update(prog_bar.total - prog_bar.n)
+                    return [i, t_val - (embed_space - 128)] # Returns index aka number of pixels needed to retrieve header
 
-            bounds_check_pixels = self._calc_new_pixel_pair(pixel_pair, range_keys[1] - pixel_diff, pixel_diff)
-            if bounds_check_pixels[0] < 0 or bounds_check_pixels[1] > 255:
-                continue
+                pixel_pair = pixel_array[i:i+2]
+                pixel_diff = int(pixel_pair[1]) - int(pixel_pair[0])
+                range_keys = self._get_range_keys(abs(pixel_diff))
 
-            t_val = range_keys[2] # Number of bits to embed
-            embed_space += t_val
+                bounds_check_pixels = self._calc_new_pixel_pair(pixel_pair, range_keys[1] - pixel_diff, pixel_diff)
+                if bounds_check_pixels[0] < 0 or bounds_check_pixels[1] > 255:
+                    continue
+
+                t_val = range_keys[2] # Number of bits to embed
+                embed_space += t_val
+                prog_bar.update(t_val)
     
     def _pvd_calculate_space(self):
-        self.logger.debug("Calculating maximum payload size")
+        self.logger.info("Calculating maximum payload size:")
         embed_space = 0
         pixel_array = self.src_img_pixels.flatten()
-        
-        for i in range(0, pixel_array.size - 1, 2):
-            pixel_pair = pixel_array[i:i+2]
-            pixel_diff = int(pixel_pair[1]) - int(pixel_pair[0])
-            range_keys = self._get_range_keys(abs(pixel_diff))
 
-            bounds_check_pixels = self._calc_new_pixel_pair(pixel_pair, range_keys[1] - pixel_diff, pixel_diff)
-            if bounds_check_pixels[0] < 0 or bounds_check_pixels[1] > 255:
-                continue
+        total_size = pixel_array.size - 1
 
-            t_val = range_keys[2] # Number of bits to embed
-            embed_space += t_val
+        with tqdm(total=total_size+1, file=sys.stdout) as prog_bar:
+            for i in range(0, total_size, 2):
+                pixel_pair = pixel_array[i:i+2]
+                pixel_diff = int(pixel_pair[1]) - int(pixel_pair[0])
+                range_keys = self._get_range_keys(abs(pixel_diff))
 
-        return embed_space
+                prog_bar.update(2)
 
-    def _pvd_embed(self, pixel_array, payload_bits):             
+                bounds_check_pixels = self._calc_new_pixel_pair(pixel_pair, range_keys[1] - pixel_diff, pixel_diff)
+                if bounds_check_pixels[0] < 0 or bounds_check_pixels[1] > 255:
+                    continue
+
+                t_val = range_keys[2] # Number of bits to embed
+                embed_space += t_val
+            return embed_space
+
+    def _pvd_embed(self, pixel_array, payload_bits):     
+        self.logger.info("Embedding data:")        
         pixel_array_enc = np.copy(pixel_array)
         req_pixel_space = len(payload_bits)
 
         pixel_array = pixel_array.flatten()
         payload_bit_index = 0
 
-        for i in range(0, pixel_array.size - 1, 2):
-            pixel_pair = pixel_array[i:i+2]
-            pixel_diff = int(pixel_pair[1]) - int(pixel_pair[0])
-            range_keys = self._get_range_keys(abs(pixel_diff))
+        with tqdm(total=req_pixel_space, file=sys.stdout) as prog_bar:
+            for i in range(0, pixel_array.size - 1, 2):
+                pixel_pair = pixel_array[i:i+2]
+                pixel_diff = int(pixel_pair[1]) - int(pixel_pair[0])
+                range_keys = self._get_range_keys(abs(pixel_diff))
 
-            bounds_check_pixels = self._calc_new_pixel_pair(pixel_pair, range_keys[1] - pixel_diff, pixel_diff)
-            if bounds_check_pixels[0] < 0 or bounds_check_pixels[1] > 255:
-                continue
+                bounds_check_pixels = self._calc_new_pixel_pair(pixel_pair, range_keys[1] - pixel_diff, pixel_diff)
+                if bounds_check_pixels[0] < 0 or bounds_check_pixels[1] > 255:
+                    continue
 
-            t_val = range_keys[2] # Number of bits to embed
-            bits_to_embed = payload_bits[payload_bit_index:payload_bit_index+t_val]
+                t_val = range_keys[2] # Number of bits to embed
+                bits_to_embed = payload_bits[payload_bit_index:payload_bit_index+t_val]
+                bits_to_embed_size = len(bits_to_embed)
 
-            if len(bits_to_embed) < t_val:
-                bits_to_embed = np.pad(bits_to_embed, mode='constant', pad_width=(0, t_val - len(bits_to_embed)))
+                if bits_to_embed_size < t_val:
+                    bits_to_embed = np.pad(bits_to_embed, mode='constant', pad_width=(0, t_val - bits_to_embed_size))
 
-            bits_packed = np.packbits(bits_to_embed[::-1], bitorder='little')
-            bits_decimal_val = int.from_bytes(np.ndarray.tobytes(bits_packed), byteorder='little')
+                bits_packed = np.packbits(bits_to_embed[::-1], bitorder='little')
+                bits_decimal_val = int.from_bytes(np.ndarray.tobytes(bits_packed), byteorder='little')
 
-            if pixel_diff >= 0:
-                new_diff = range_keys[0] + bits_decimal_val
-            else:
-                new_diff = -(range_keys[0] + bits_decimal_val)
-                
-            m_val = new_diff - pixel_diff
+                if pixel_diff >= 0:
+                    new_diff = range_keys[0] + bits_decimal_val
+                else:
+                    new_diff = -(range_keys[0] + bits_decimal_val)
+                    
+                m_val = new_diff - pixel_diff
 
-            pixel_pair_new = self._calc_new_pixel_pair(pixel_pair, m_val, pixel_diff)                                     
-            pixel_array[i] = pixel_pair_new[0]
-            pixel_array[i+1] = pixel_pair_new[1]
+                pixel_pair_new = self._calc_new_pixel_pair(pixel_pair, m_val, pixel_diff)                                     
+                pixel_array[i] = pixel_pair_new[0]
+                pixel_array[i+1] = pixel_pair_new[1]
 
-            payload_bit_index += len(bits_to_embed)
+                payload_bit_index += bits_to_embed_size
+                prog_bar.update(bits_to_embed_size)
 
-            if payload_bit_index >= req_pixel_space:
-                break
+                if payload_bit_index >= req_pixel_space:
+                    break
 
-        return pixel_array
+            return pixel_array
 
     def _pvd_extract(self, enc_pixels, pixel_start_index, pixel_stop_index, bits_to_extract, bit_start_index = 0):
-        payload = []
+        self.logger.info("Extracting data:")
 
+        payload = []
         enc_pixels = enc_pixels.flatten()
 
-        for i in range(pixel_start_index, pixel_stop_index, 2):
-            if len(payload) >= bits_to_extract:
-                return payload
+        with tqdm(total=bits_to_extract, file=sys.stdout) as prog_bar:
+            for i in range(pixel_start_index, pixel_stop_index, 2):
+                if len(payload) >= bits_to_extract:
+                    prog_bar.total = len(payload)
+                    return payload
 
-            pixel_pair = enc_pixels[i:i+2]
-            pixel_diff = int(pixel_pair[1]) - int(pixel_pair[0])
-            range_keys = self._get_range_keys(abs(pixel_diff))
+                pixel_pair = enc_pixels[i:i+2]
+                pixel_diff = int(pixel_pair[1]) - int(pixel_pair[0])
+                range_keys = self._get_range_keys(abs(pixel_diff))
 
-            bounds_check_pixels = self._calc_new_pixel_pair(pixel_pair, range_keys[1] - pixel_diff, pixel_diff)
-            if bounds_check_pixels[0] < 0 or bounds_check_pixels[1] > 255:
-                continue
-            
-            b_val = abs(pixel_diff - range_keys[0]) # Diff - Lower Val
-            t_val = range_keys[2]
+                bounds_check_pixels = self._calc_new_pixel_pair(pixel_pair, range_keys[1] - pixel_diff, pixel_diff)
+                if bounds_check_pixels[0] < 0 or bounds_check_pixels[1] > 255:
+                    continue
+                
+                b_val = abs(pixel_diff - range_keys[0]) # Diff - Lower Val
+                t_val = range_keys[2]
 
-            bits_extracted = np.unpackbits(np.array([b_val], dtype=np.uint8))[-t_val:].tolist()
+                bits_extracted = np.unpackbits(np.array([b_val], dtype=np.uint8))[-t_val:].tolist()
 
-            if bit_start_index != 0:
-                bits_extracted = bits_extracted[bit_start_index:]
-                bit_start_index = 0
+                if bit_start_index != 0:
+                    bits_extracted = bits_extracted[bit_start_index:]
+                    bit_start_index = 0
 
-            payload.extend(bits_extracted)
+                payload.extend(bits_extracted)
+                prog_bar.update(len(bits_extracted))
 
-        return payload            
+            prog_bar.total = len(payload)
+            return payload            
 
     def get_info(self):
+
+        if self.max_payload_size is None:
+            self.max_payload_size = self._pvd_calculate_space()
+
         image_info = ""
         image_info += f"\nImage ({self.src_img_path})"
         image_info += "\n-----------------------"
@@ -432,6 +466,8 @@ class PVDProcessor(Processor):
             self.logger.critical(f"Cannot embed payload larger than {(np.iinfo(np.uint32).max // 8)} bytes")
             sys.exit(1)
         
+        if self.max_payload_size is None:
+            self.max_payload_size = self._pvd_calculate_space()
         
         if req_pixel_space > self.max_payload_size:
             self.logger.critical("Cannot embed this payload in the cover image because it is too large")
@@ -454,10 +490,6 @@ class PVDProcessor(Processor):
 
         header_payload_size = self.header["payload_size"]
         header_payload_checksum = self.header["payload_checksum"]
-
-        if self.max_payload_size < header_payload_size + 128 or header_payload_size < 1:
-            self.logger.critical("Invalid payload size specified in header")
-            sys.exit(1)
 
         self.logger.info(f"Extracting {util.human_readable_size(header_payload_size // 8, 2)} payload from the image") 
 

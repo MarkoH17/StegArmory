@@ -35,14 +35,6 @@ class StegMethod(Enum):
     PVD = 2
     EBE = 4
 
-class StegMethodChannel(Enum):
-    RED = 1
-    GREEN = 2
-    BLUE = 4
-    ALPHA = 8
-    RGB = 16
-    RGBA = 32
-
 class LSBProcessor(Processor):
 
     def __init__(self, src_image_path):
@@ -51,8 +43,8 @@ class LSBProcessor(Processor):
 
     def _get_header(self):
         self.logger.info("Getting image header")
-        image_header_bits = self.lsb_extractor(self.src_img_pixels.flatten()[:128]) #Extract the first 128 bits (16 bytes) for the header
-        
+        image_header_bits = self._lsb_extract(self.src_img_pixels.flatten()[:128], 128)
+
         header_magic_bits = image_header_bits[:40]
         
         if not np.array_equal(np.packbits(header_magic_bits), np.frombuffer(np.array(["SAMRH"], dtype='|S5'), dtype='uint8')):
@@ -61,35 +53,42 @@ class LSBProcessor(Processor):
         
         header_method_bits = image_header_bits[40:48]
         header_method = np.frombuffer(np.packbits(header_method_bits), dtype='uint8')[0]
-
-        header_image_channels_bits = image_header_bits[48:56]
-        header_image_channels = np.frombuffer(np.packbits(header_image_channels_bits), dtype='uint8')[0]
         
-        header_payload_size_bits = image_header_bits[56:88]
+        header_payload_size_bits = image_header_bits[48:80]
         header_payload_size = np.frombuffer(np.packbits(header_payload_size_bits), dtype='uint32')[0]
 
 
-        header_payload_checksum_bits = image_header_bits[88:120]
+        header_payload_checksum_bits = image_header_bits[80:112]
         header_payload_checksum = np.frombuffer(np.packbits(header_payload_checksum_bits), dtype='uint32')[0]
+
+        header_payload_xor_flag_bits = image_header_bits[112:120]
+        header_payload_xor_flag = np.frombuffer(np.packbits(header_payload_xor_flag_bits), dtype='uint8')[0]
 
         return {
             "method": header_method,
-            "image_channels": header_image_channels,
             "payload_size": header_payload_size,
-            "payload_checksum": header_payload_checksum
+            "payload_checksum": header_payload_checksum,
+            "payload_xor_encoded": header_payload_xor_flag
         }
 
     def _lsb_embed(self, pixel_array, payload_bits):
         self.logger.info("Embedding data:")
+
+        pixel_array_enc = np.copy(pixel_array)
+        pixel_array_enc = pixel_array_enc.flatten()
+        
         req_pixel_space = len(payload_bits)
+
         with tqdm(total=req_pixel_space, file=sys.stdout) as prog_bar:
-            with np.nditer(pixel_array, op_flags=['readwrite'], flags=['c_index']) as iterator:
+            with np.nditer(pixel_array_enc, op_flags=['readwrite'], flags=['c_index']) as iterator:
                 for pixel in iterator:
                     if iterator.index >= req_pixel_space:
                         break
                     
                     pixel[...] = pixel & 0xFE | payload_bits[iterator.index]
                     prog_bar.update(1)
+
+            return pixel_array_enc
 
     def _lsb_extract(self, pixel_array, payload_size):
         payload = []
@@ -114,20 +113,27 @@ class LSBProcessor(Processor):
             image_info += f"\nEmbedded Header ({self.src_img_path})"
             image_info += "\n-----------------------"
             image_info += f"\nSteg Method: {StegMethod(self.header['method']).name}"
-            image_info += f"\nEmbed Channels: {StegMethodChannel(self.header['image_channels']).name}"
             image_info += f"\nPayload Size: {util.human_readable_size(self.header['payload_size'] // 8, 2)}"
             image_info += f"\nPayload Checksum: {hex(self.header['payload_checksum'])}"
+            image_info += f"\nPayload XOR encoded: {bool(self.header['payload_xor_encoded'])}"
             image_info += "\n-----------------------\n"
 
         self.logger.info(image_info)
 
-    def embed_payload(self, payload, dst_image):
-        enc_pixels = np.copy(self.src_img_pixels)
-
+    def embed_payload(self, payload, dst_image, xor_key = 0):
         with open(payload, 'rb') as file: 
             payload_data = file.read()
 
         payload_checksum = binascii.crc32(payload_data)
+        
+        xor_encoded = False
+        if xor_key != 0:
+            if xor_key < 1 or xor_key > 255:
+                self.logger.critical("XOR key larger outside allowed range (1-255).")
+                sys.exit(1)
+            xor_encoded = True
+            payload_data = global_xor_encoder(payload_data, xor_key)
+
         payload_bits = np.unpackbits(np.frombuffer(payload_data, dtype="uint8", count=len(payload_data)))
         req_pixel_space = len(payload_bits)
 
@@ -142,14 +148,13 @@ class LSBProcessor(Processor):
             sys.exit(1)
 
         self.logger.info("Setting header during embed")
-        header_bits = global_gen_header(StegMethod.LSB, StegMethodChannel.RGB, req_pixel_space, payload_checksum)
+        header_bits = global_gen_header(StegMethod.LSB, req_pixel_space, payload_checksum, xor_encoded)
         complete_payload = np.concatenate((header_bits, payload_bits))
          
-        self._lsb_embed(enc_pixels, complete_payload)
-
+        enc_pixels = self._lsb_embed(self.src_img_pixels, complete_payload)
         global_save_img_from_pixels(self, enc_pixels, dst_image)
 
-    def extract_payload(self, payload_save_path):
+    def extract_payload(self, payload_save_path, xor_key = 0):
         if self.header is None:
             self.logger.critical("Missing embedded header in image! Cannot extract payload.")
             sys.exit(1)
@@ -163,11 +168,10 @@ class LSBProcessor(Processor):
             
         self.logger.info(f"Extracting {util.human_readable_size(header_payload_size // 8, 2)} payload from the image")
 
-
-        #dec_payload_bits = self.lsb_extractor((self.src_img_pixels.flatten())[128:header_payload_size+128])
         dec_payload_bits = self._lsb_extract((self.src_img_pixels.flatten())[128:header_payload_size+128], header_payload_size)
-        
         payload_bytes = np.ndarray.tobytes(np.packbits(dec_payload_bits))
+        if self.header['payload_xor_encoded']:
+            payload_bytes = global_xor_encoder(payload_bytes, xor_key)
         payload_checksum = binascii.crc32(payload_bytes)
 
         if payload_checksum != header_payload_checksum:
@@ -186,7 +190,6 @@ class LSBProcessor(Processor):
         colorB = cv2.cvtColor(image.src_img_pixels, cv2.COLOR_BGR2RGB)
 
         psnr = skimage.metrics.peak_signal_noise_ratio(self.src_img, image.src_img)
-
         (score, diff) = skimage.metrics.structural_similarity(colorA, colorB, full=True, multichannel=True)
         
         self.comparison_stats = {
@@ -236,20 +239,15 @@ class PVDProcessor(Processor):
         
         header_method_bits = image_header_bits[40:48]
         header_method = np.frombuffer(np.packbits(header_method_bits), dtype='uint8')[0]
-
-        header_image_channels_bits = image_header_bits[48:56]
-        header_image_channels = np.frombuffer(np.packbits(header_image_channels_bits), dtype='uint8')[0]
         
         header_payload_size_bits = image_header_bits[56:88]
         header_payload_size = np.frombuffer(np.packbits(header_payload_size_bits), dtype='uint32')[0]
-
 
         header_payload_checksum_bits = image_header_bits[88:120]
         header_payload_checksum = np.frombuffer(np.packbits(header_payload_checksum_bits), dtype='uint32')[0]
 
         return {
             "method": header_method,
-            "image_channels": header_image_channels,
             "payload_size": header_payload_size,
             "payload_checksum": header_payload_checksum
         }
@@ -345,16 +343,18 @@ class PVDProcessor(Processor):
             return embed_space
 
     def _pvd_embed(self, pixel_array, payload_bits):     
-        self.logger.info("Embedding data:")        
+        self.logger.info("Embedding data:")  
+
         pixel_array_enc = np.copy(pixel_array)
+        pixel_array_enc = pixel_array_enc.flatten()
+        
         req_pixel_space = len(payload_bits)
 
-        pixel_array = pixel_array.flatten()
         payload_bit_index = 0
 
         with tqdm(total=req_pixel_space, file=sys.stdout) as prog_bar:
-            for i in range(0, pixel_array.size - 1, 2):
-                pixel_pair = pixel_array[i:i+2]
+            for i in range(0, pixel_array_enc.size - 1, 2):
+                pixel_pair = pixel_array_enc[i:i+2]
                 pixel_diff = int(pixel_pair[1]) - int(pixel_pair[0])
                 range_keys = self._get_range_keys(abs(pixel_diff))
 
@@ -380,16 +380,16 @@ class PVDProcessor(Processor):
                 m_val = new_diff - pixel_diff
 
                 pixel_pair_new = self._calc_new_pixel_pair(pixel_pair, m_val, pixel_diff)                                     
-                pixel_array[i] = pixel_pair_new[0]
-                pixel_array[i+1] = pixel_pair_new[1]
+                pixel_array_enc[i] = pixel_pair_new[0]
+                pixel_array_enc[i+1] = pixel_pair_new[1]
 
                 payload_bit_index += bits_to_embed_size
                 prog_bar.update(bits_to_embed_size)
 
                 if payload_bit_index >= req_pixel_space:
-                    break
+                    return pixel_array_enc
 
-            return pixel_array
+            return pixel_array_enc
 
     def _pvd_extract(self, enc_pixels, pixel_start_index, pixel_stop_index, bits_to_extract, bit_start_index = 0):
         self.logger.info("Extracting data:")
@@ -443,20 +443,27 @@ class PVDProcessor(Processor):
             image_info += f"\nEmbedded Header ({self.src_img_path})"
             image_info += "\n-----------------------"
             image_info += f"\nSteg Method: {StegMethod(self.header['method']).name}"
-            image_info += f"\nEmbed Channels: {StegMethodChannel(self.header['image_channels']).name}"
             image_info += f"\nPayload Size: {util.human_readable_size(self.header['payload_size'] // 8, 2)}"
             image_info += f"\nPayload Checksum: {hex(self.header['payload_checksum'])}"
+            image_info += f"\nPayload XOR encoded: {bool(self.header['payload_xor_encoded'])}"
             image_info += "\n-----------------------\n"
 
         self.logger.info(image_info)
 
-    def embed_payload(self, payload, dst_image):
-        enc_pixels = np.copy(self.src_img_pixels)
-
+    def embed_payload(self, payload, dst_image, xor_key = 0):
         with open(payload, 'rb') as file: 
             payload_data = file.read()
 
         payload_checksum = binascii.crc32(payload_data)
+
+        xor_encoded = False
+        if xor_key != 0:
+            if xor_key < 1 or xor_key > 255:
+                self.logger.critical("XOR key larger outside allowed range (1-255).")
+                sys.exit(1)
+            xor_encoded = True
+            payload_data = global_xor_encoder(payload_data, xor_key)
+
         payload_bits = np.unpackbits(np.frombuffer(payload_data, dtype="uint8", count=len(payload_data)))
         req_pixel_space = len(payload_bits)
 
@@ -474,13 +481,10 @@ class PVDProcessor(Processor):
             sys.exit(1)
         
         self.logger.info("Setting header during embed")
-        header_bits = global_gen_header(StegMethod.PVD, StegMethodChannel.RGB, req_pixel_space, payload_checksum)
+        header_bits = global_gen_header(StegMethod.PVD, req_pixel_space, payload_checksum, xor_encoded)
         complete_payload = np.concatenate((header_bits, payload_bits))
 
-        enc_pixels = self._pvd_embed(enc_pixels, complete_payload)
-
-        enc_pixels = np.reshape(enc_pixels, self.src_img_pixels.shape)
-
+        enc_pixels = self._pvd_embed(self.src_img_pixels, complete_payload)
         global_save_img_from_pixels(self, enc_pixels, dst_image)
 
     def extract_payload(self, payload_save_path):
@@ -500,6 +504,8 @@ class PVDProcessor(Processor):
 
         dec_payload_bits = self._pvd_extract(self.src_img_pixels, header_stop_pixel[0], self.src_img_pixels.size - 1, header_payload_size, header_stop_pixel[1])[:header_payload_size]
         payload_bytes = np.ndarray.tobytes(np.packbits(dec_payload_bits))
+        if self.header['payload_xor_encoded']:
+            payload_bytes = global_xor_encoder(payload_bytes, xor_key)
         payload_checksum = binascii.crc32(payload_bytes)
 
         if payload_checksum != header_payload_checksum:
@@ -516,7 +522,6 @@ class PVDProcessor(Processor):
         colorB = cv2.cvtColor(image.src_img_pixels, cv2.COLOR_BGR2RGB)
 
         psnr = skimage.metrics.peak_signal_noise_ratio(self.src_img, image.src_img)
-
         (score, diff) = skimage.metrics.structural_similarity(colorA, colorB, full=True, multichannel=True)
         
         self.comparison_stats = {
@@ -561,20 +566,23 @@ def global_init(self, src_image_path):
     self.header = self._get_header()
     self.comparison_stats = None
 
-def global_gen_header(method, image_channels, payload_size, payload_checksum):
+def global_gen_header(method, payload_size, payload_checksum, payload_xor_encoded = False):
     header_magic = "SAMRH"                                  # Magic Bytes                                       [5 bytes]
     header_method = method.value                            # (refer to StegMethod enum values)                 [1 byte]
-    header_image_channels = image_channels.value            # (refer to StegMethodChannel enum values)          [1 byte]
     header_payload_size = payload_size                      # Size of payload (bits)                            [4 bytes]
     header_payload_checksum = payload_checksum              # CRC32 of payload (unsigned CRC32)                 [4 bytes]
+    header_xor_encoded = int(payload_xor_encoded)           # Flag to specify whether payload is XOR encoded    [1 byte]
     header_payload_reserved = 0                             # Reserved Byte                                     [1 byte]
 
-    header_data = np.array([(header_magic, header_method, header_image_channels, header_payload_size, header_payload_checksum, header_payload_reserved)], dtype='|S5, int8, int8, uint32, uint32, int8')[0]
+    header_data = np.array([(header_magic, header_method, header_payload_size, header_payload_checksum, header_xor_encoded, header_payload_reserved)], dtype='|S5, int8, uint32, uint32, int8, int8')[0]
     header_data_bits = np.unpackbits(np.frombuffer(header_data, dtype="uint8", count=header_data.nbytes))
 
     return header_data_bits
 
 def global_save_img_from_pixels(self, pixels, save_path):
+
+    pixels = np.reshape(pixels, self.src_img_pixels.shape)
+
     if self.has_alpha:
         pixels = cv2.cvtColor(pixels, cv2.COLOR_RGBA2BGRA)
     else:
@@ -583,3 +591,6 @@ def global_save_img_from_pixels(self, pixels, save_path):
     cv2.imwrite(save_path, pixels)
 
     self.logger.info("Successfully embedded payload in cover image")
+
+def global_xor_encoder(data, xor_key):
+    return bytes([b ^ xor_key for b in data])

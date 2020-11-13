@@ -1,7 +1,8 @@
 from abc import ABC, abstractmethod
 from enum import Enum
 import numpy as np
-import cv2, util, binascii, math
+import skimage.metrics
+import cv2, util, binascii, math, imutils, sys
 
 class Processor(ABC):
     @abstractmethod
@@ -18,6 +19,10 @@ class Processor(ABC):
     
     @abstractmethod
     def compare(self):
+        pass
+
+    @abstractmethod
+    def visual_compare(self):
         pass
 
     @abstractmethod
@@ -115,10 +120,12 @@ class LSBProcessor(Processor):
 
         if req_pixel_space > np.iinfo(np.uint32).max:
             print(f"ERROR: Cannot embed files larger than {(np.iinfo(np.uint32).max // 8)} bytes")
+            #sys.exit(1)
             return
 
         if req_pixel_space > (self.total_pixels * 3) or req_pixel_space == 0:
             print("ERROR: Cannot embed this file in the cover image")
+            #sys.exit(1)
             return
 
         header_bits = global_gen_header(StegMethod.LSB, StegMethodChannel.RGB, req_pixel_space, payload_checksum)
@@ -131,6 +138,7 @@ class LSBProcessor(Processor):
     def extract_payload(self, payload_save_path):
         if self.header is None:
             print("ERROR: Missing embedded header in image! Cannot extract payload.")
+            #sys.exit(1)
             return
 
         header_payload_size = self.header["payload_size"]
@@ -140,6 +148,7 @@ class LSBProcessor(Processor):
 
         if self.src_img_pixels.size < header_payload_size - 128:
             print("ERROR: Invalid payload size specified in header")
+            #sys.exit(1)
             return
         
         dec_payload_bits = self.lsb_extractor((self.src_img_pixels.flatten())[128:header_payload_size+128])
@@ -148,6 +157,7 @@ class LSBProcessor(Processor):
 
         if payload_checksum != header_payload_checksum:
             print("ERROR: Failed to verify payload checksum!")
+            #sys.exit(1)
             return
         
         with open(payload_save_path, 'wb') as file:
@@ -155,13 +165,49 @@ class LSBProcessor(Processor):
         
         print(f"Successfully extracted payload and saved to {payload_save_path}")
     
-    def compare(self, Image):
-        pass
+    def compare(self, image):
+        colorA = cv2.cvtColor(self.src_img_pixels, cv2.COLOR_BGR2RGB)
+        colorB = cv2.cvtColor(image.src_img_pixels, cv2.COLOR_BGR2RGB)
+
+        psnr = skimage.metrics.peak_signal_noise_ratio(self.src_img, image.src_img)
+
+        (score, diff) = skimage.metrics.structural_similarity(colorA, colorB, full=True, multichannel=True)
+        
+        self.comparison_stats = {
+            "psnr": psnr,
+            "ssim": score    
+        }
+
+        print("PSNR: " + str(round(psnr, 4)))
+        print("SSIM: " + str(round(score, 4)))
+                
+
+    def visual_compare(self, image):
+        grayA = cv2.cvtColor(self.src_img_pixels, cv2.COLOR_BGR2GRAY)
+        grayB = cv2.cvtColor(image.src_img_pixels, cv2.COLOR_BGR2GRAY)
+
+        (score, diff) = skimage.metrics.structural_similarity(colorA, colorB, full=True, multichannel=False)
+        diff = (diff * 255).astype("uint8")
+
+        thresh = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+        contours = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = contours[0] if len(contours) == 2 else contours[1]
+
+        filled_after = image.src_img.copy()
+
+        for c in contours:
+            cv2.drawContours(filled_after, [c], 0, (0,255,0), -1)
+
+        cv2.imshow('filled after',filled_after)
+        cv2.waitKey(0)
+
+        
 
 class PVDProcessor(Processor):
     def __init__(self, src_image_path):
         global_init(self, src_image_path)
         self.max_payload_size = self._pvd_calculate_space()
+        
 
     def _get_header(self):
         header_stop_pixel = self._pvd_get_header_boundary(self.src_img_pixels)
@@ -215,18 +261,53 @@ class PVDProcessor(Processor):
         return np.floor(pixels).astype('int32').tolist()
 
     def _get_range_keys(self, pixel_difference):
+        '''
         wu_tsai_ranges = [
-            list(range(0, 7 + 1)),
-            list(range(8, 15 + 1)),
-            list(range(16, 31 + 1)),
-            list(range(32, 63 + 1)),
-            list(range(64, 127 + 1)),
-            list(range(128, 255 + 1))
+            list(range(0, 7 + 1)), #0-8
+            list(range(8, 15 + 1)), #8-16
+            list(range(16, 31 + 1)), #16-32
+            list(range(32, 63 + 1)), #32-64
+            list(range(64, 127 + 1)), #64 - 128
+            list(range(128, 255 + 1)) #128 - 256
+        ]
+        
+        wu_tsai_ranges = [
+            list(range(0, 1 + 1)),
+            list(range(2, 3 + 1)),
+            list(range(4, 7 + 1)),
+            list(range(8, 11 + 1)),
+            list(range(12, 15 + 1)),
+            list(range(16, 23 + 1)),
+            list(range(24, 31 + 1)),
+            list(range(32, 47 + 1)),
+            list(range(48, 63 + 1)),
+            list(range(64, 95 + 1)),
+            list(range(96, 127 + 1)),
+            list(range(128, 191 + 1)),
+            list(range(192, 255 + 1))
+        ]
+        '''
+
+        wu_tsai_ranges = [
+            [0, 1, 1],
+            [2, 3, 1],
+            [4, 7, 2],
+            [8, 11, 2],
+            [12, 15, 2],
+            [16, 23, 3],
+            [24, 31, 3],
+            [32, 47, 4],
+            [48, 63, 4],
+            [64, 95, 5],
+            [96, 127, 5],
+            [128, 191, 6],
+            [192, 255, 6]
         ]
 
+        
         for sub_range in wu_tsai_ranges:
-            if pixel_difference in sub_range:
-                return [sub_range[0], sub_range[-1]] #Return first and last value in range      
+            if sub_range[0] <= pixel_difference <= sub_range[1]: # If pixel_difference belongs to a subrange
+                return sub_range
 
     def _pvd_get_header_boundary(self, enc_pixels):
         embed_space = 0
@@ -244,7 +325,7 @@ class PVDProcessor(Processor):
             if bounds_check_pixels[0] < 0 or bounds_check_pixels[1] > 255:
                 continue
 
-            t_val = math.floor(math.log2(range_keys[1] - range_keys[0] + 1)) # Number of bits to embed
+            t_val = range_keys[2] # Number of bits to embed
             embed_space += t_val
     
     def _pvd_calculate_space(self):
@@ -260,7 +341,7 @@ class PVDProcessor(Processor):
             if bounds_check_pixels[0] < 0 or bounds_check_pixels[1] > 255:
                 continue
 
-            t_val = math.floor(math.log2(range_keys[1] - range_keys[0] + 1)) # Number of bits to embed
+            t_val = range_keys[2] # Number of bits to embed
             embed_space += t_val
 
         return embed_space
@@ -281,7 +362,7 @@ class PVDProcessor(Processor):
             if bounds_check_pixels[0] < 0 or bounds_check_pixels[1] > 255:
                 continue
 
-            t_val = math.floor(math.log2(range_keys[1] - range_keys[0] + 1)) # Number of bits to embed
+            t_val = range_keys[2] # Number of bits to embed
             bits_to_embed = payload_bits[payload_bit_index:payload_bit_index+t_val]
 
             if len(bits_to_embed) < t_val:
@@ -338,7 +419,7 @@ class PVDProcessor(Processor):
                 continue
             
             b_val = abs(pixel_diff - range_keys[0]) # Diff - Lower Val
-            t_val = math.floor(math.log2(range_keys[1] - range_keys[0] + 1))
+            t_val = range_keys[2]
 
             bits_extracted = np.unpackbits(np.array([b_val], dtype=np.uint8))[-t_val:].tolist()
 
@@ -393,11 +474,13 @@ class PVDProcessor(Processor):
 
         if req_pixel_space > np.iinfo(np.uint32).max:
             print(f"ERROR: Cannot embed files larger than {(np.iinfo(np.uint32).max // 8)} bytes")
+            #sys.exit(1)
             return
         
         
         if req_pixel_space > self.max_payload_size:
             print("ERROR: Cannot embed this file in the cover image")
+            #sys.exit(1)
             return
         
 
@@ -411,9 +494,9 @@ class PVDProcessor(Processor):
         global_save_img_from_pixels(self, enc_pixels, dst_image)
 
     def extract_payload(self, payload_save_path):
-
         if self.header is None:
             print("ERROR: Missing embedded header in image! Cannot extract payload.")
+            #sys.exit(1)
             return
 
         header_payload_size = self.header["payload_size"]
@@ -432,6 +515,7 @@ class PVDProcessor(Processor):
 
         if payload_checksum != header_payload_checksum:
             print("ERROR: Failed to verify payload checksum!")
+            #sys.exit(1)
             return
         
         with open(payload_save_path, 'wb') as file:
@@ -439,8 +523,42 @@ class PVDProcessor(Processor):
         
         print(f"Successfully extracted payload and saved to {payload_save_path}")
     
-    def compare(self, Image):
-        pass
+    def compare(self, image):
+        colorA = cv2.cvtColor(self.src_img_pixels, cv2.COLOR_BGR2RGB)
+        colorB = cv2.cvtColor(image.src_img_pixels, cv2.COLOR_BGR2RGB)
+
+        psnr = skimage.metrics.peak_signal_noise_ratio(self.src_img, image.src_img)
+
+        (score, diff) = skimage.metrics.structural_similarity(colorA, colorB, full=True, multichannel=True)
+        
+        self.comparison_stats = {
+            "psnr": psnr,
+            "ssim": score    
+        }
+
+        print("PSNR: " + str(round(psnr, 4)))
+        print("SSIM: " + str(round(score, 4)))
+                
+
+    def visual_compare(self, image):
+        grayA = cv2.cvtColor(self.src_img_pixels, cv2.COLOR_BGR2GRAY)
+        grayB = cv2.cvtColor(image.src_img_pixels, cv2.COLOR_BGR2GRAY)
+
+        (score, diff) = skimage.metrics.structural_similarity(colorA, colorB, full=True, multichannel=False)
+        diff = (diff * 255).astype("uint8")
+
+        thresh = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+        contours = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = contours[0] if len(contours) == 2 else contours[1]
+
+        filled_after = image.src_img.copy()
+
+        for c in contours:
+            cv2.drawContours(filled_after, [c], 0, (0,255,0), -1)
+
+        cv2.imshow('filled after',filled_after)
+        cv2.waitKey(0)
+
 
 def global_init(self, src_image_path):
     self.src_img_path = src_image_path
@@ -452,6 +570,7 @@ def global_init(self, src_image_path):
     self.src_img_pixels = cv2.cvtColor(self.src_img, cv2.COLOR_BGR2RGBA) if self.has_alpha else cv2.cvtColor(self.src_img, cv2.COLOR_BGR2RGB)
     self.max_payload_size = None
     self.header = self._get_header()
+    self.comparison_stats = None
 
 def global_gen_header(method, image_channels, payload_size, payload_checksum):
     print("Setting header during embed")
@@ -474,6 +593,6 @@ def global_save_img_from_pixels(self, pixels, save_path):
     else:
         pixels = cv2.cvtColor(pixels, cv2.COLOR_RGB2BGR)
 
-    cv2.imwrite(save_path, pixels, [cv2.IMWRITE_PNG_COMPRESSION, 9])
+    cv2.imwrite(save_path, pixels)
 
     print("Successfully embedded payload in cover image")

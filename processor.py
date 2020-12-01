@@ -72,14 +72,14 @@ class LSBProcessor(Processor):
         }
 
     def _lsb_embed(self, pixel_array, payload_bits):
-        self.logger.info("Embedding data:")
+        self.logger.info("Embedding data")
 
         pixel_array_enc = np.copy(pixel_array)
         pixel_array_enc = pixel_array_enc.flatten()
         
         req_pixel_space = len(payload_bits)
 
-        with tqdm(total=req_pixel_space, file=sys.stdout) as prog_bar:
+        with tqdm(total=req_pixel_space, file=sys.stdout, leave=False) as prog_bar:
             with np.nditer(pixel_array_enc, op_flags=['readwrite'], flags=['c_index']) as iterator:
                 for pixel in iterator:
                     if iterator.index >= req_pixel_space:
@@ -92,8 +92,8 @@ class LSBProcessor(Processor):
 
     def _lsb_extract(self, pixel_array, payload_size):
         payload = []
-        self.logger.info("Extracting data:")
-        with tqdm(total=payload_size, file=sys.stdout) as prog_bar:
+        self.logger.info("Extracting data")
+        with tqdm(total=payload_size, file=sys.stdout, leave=False) as prog_bar:
             with np.nditer(pixel_array, flags=['c_index']) as iterator:
                 for pixel in iterator:
                     payload.append(pixel & 1)
@@ -233,6 +233,8 @@ class PVDProcessor(Processor):
         image_header_bits = self._pvd_extract(self.src_img_pixels, 0, header_stop_pixel[0], 128)
         header_magic_bits = image_header_bits[:40]
 
+        header_magic_bits = image_header_bits[:40]
+        
         if not np.array_equal(np.packbits(header_magic_bits), np.frombuffer(np.array(["SAMRH"], dtype='|S5'), dtype='uint8')):
             self.logger.warn("This image has not been processed with StegArmory!")
             return       
@@ -240,16 +242,21 @@ class PVDProcessor(Processor):
         header_method_bits = image_header_bits[40:48]
         header_method = np.frombuffer(np.packbits(header_method_bits), dtype='uint8')[0]
         
-        header_payload_size_bits = image_header_bits[56:88]
+        header_payload_size_bits = image_header_bits[48:80]
         header_payload_size = np.frombuffer(np.packbits(header_payload_size_bits), dtype='uint32')[0]
 
-        header_payload_checksum_bits = image_header_bits[88:120]
+
+        header_payload_checksum_bits = image_header_bits[80:112]
         header_payload_checksum = np.frombuffer(np.packbits(header_payload_checksum_bits), dtype='uint32')[0]
+
+        header_payload_xor_flag_bits = image_header_bits[112:120]
+        header_payload_xor_flag = np.frombuffer(np.packbits(header_payload_xor_flag_bits), dtype='uint8')[0]
 
         return {
             "method": header_method,
             "payload_size": header_payload_size,
-            "payload_checksum": header_payload_checksum
+            "payload_checksum": header_payload_checksum,
+            "payload_xor_encoded": header_payload_xor_flag
         }
     
     def _get_payload_chunk(self, start, count, payload_bits):
@@ -300,7 +307,7 @@ class PVDProcessor(Processor):
         embed_space = 0
         pixel_array = self.src_img_pixels.flatten()
 
-        with tqdm(total=128, file=sys.stdout) as prog_bar:
+        with tqdm(total=128, file=sys.stdout, leave=False) as prog_bar:
             for i in range(0, pixel_array.size - 1, 2):
                 if embed_space >= 128:
                     prog_bar.total = embed_space
@@ -326,7 +333,7 @@ class PVDProcessor(Processor):
 
         total_size = pixel_array.size - 1
 
-        with tqdm(total=total_size+1, file=sys.stdout) as prog_bar:
+        with tqdm(total=total_size+1, file=sys.stdout, leave=False) as prog_bar:
             for i in range(0, total_size, 2):
                 pixel_pair = pixel_array[i:i+2]
                 pixel_diff = int(pixel_pair[1]) - int(pixel_pair[0])
@@ -343,7 +350,7 @@ class PVDProcessor(Processor):
             return embed_space
 
     def _pvd_embed(self, pixel_array, payload_bits):     
-        self.logger.info("Embedding data:")  
+        self.logger.info("Embedding data")  
 
         pixel_array_enc = np.copy(pixel_array)
         pixel_array_enc = pixel_array_enc.flatten()
@@ -352,7 +359,7 @@ class PVDProcessor(Processor):
 
         payload_bit_index = 0
 
-        with tqdm(total=req_pixel_space, file=sys.stdout) as prog_bar:
+        with tqdm(total=req_pixel_space, file=sys.stdout, leave=False) as prog_bar:
             for i in range(0, pixel_array_enc.size - 1, 2):
                 pixel_pair = pixel_array_enc[i:i+2]
                 pixel_diff = int(pixel_pair[1]) - int(pixel_pair[0])
@@ -392,12 +399,12 @@ class PVDProcessor(Processor):
             return pixel_array_enc
 
     def _pvd_extract(self, enc_pixels, pixel_start_index, pixel_stop_index, bits_to_extract, bit_start_index = 0):
-        self.logger.info("Extracting data:")
+        self.logger.info("Extracting data")
 
         payload = []
         enc_pixels = enc_pixels.flatten()
 
-        with tqdm(total=bits_to_extract, file=sys.stdout) as prog_bar:
+        with tqdm(total=bits_to_extract, file=sys.stdout, leave=False) as prog_bar:
             for i in range(pixel_start_index, pixel_stop_index, 2):
                 if len(payload) >= bits_to_extract:
                     prog_bar.total = len(payload)
@@ -504,6 +511,7 @@ class PVDProcessor(Processor):
 
         dec_payload_bits = self._pvd_extract(self.src_img_pixels, header_stop_pixel[0], self.src_img_pixels.size - 1, header_payload_size, header_stop_pixel[1])[:header_payload_size]
         payload_bytes = np.ndarray.tobytes(np.packbits(dec_payload_bits))
+        
         if self.header['payload_xor_encoded']:
             payload_bytes = global_xor_encoder(payload_bytes, xor_key)
         payload_checksum = binascii.crc32(payload_bytes)

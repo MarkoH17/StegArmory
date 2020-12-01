@@ -1,6 +1,7 @@
-import processor, glob, datetime, time, tabulate, util
+import processor, glob, datetime, time, tabulate, util, logging, os
 
-def main():
+def test():
+    logger = logging.LoggerAdapter(logging.getLogger(), {"caller":__name__})
 
     src_image_folder = "test/images/*.png"
     src_images = []
@@ -19,11 +20,11 @@ def main():
 
     test_methods = ["LSB", "PVD"]
 
-    print("Beginning StegArmory test!")
+    logger.info("Beginning StegArmory test!")
     
     total_iterations = len(src_images) * len(payloads) * len(test_methods)
 
-    print("Running %d test cases!" % total_iterations)
+    logger.info("Running %d test cases!" % total_iterations)
 
     results = []
 
@@ -32,35 +33,32 @@ def main():
     for src_img in src_images:
         for payload in payloads:
             for method in test_methods:
-                print_message("Testing %s embed on %s with %s" % (method, src_img, payload))
+                src_img_filename = os.path.basename(src_img)
+                payload_filename = os.path.basename(payload)
+                tmp_output_img_filename = os.path.basename(tmp_output_image)
+
+                logger.info("Testing %s embed on image %s with payload %s" % (method, src_img_filename, payload_filename))
 
                 if method == "LSB":
                     proc = processor.LSBProcessor(src_img)
                 elif method == "PVD":
                     proc = processor.PVDProcessor(src_img)
                 
-                #print_message("Fetching image information")
-                #proc.get_info()
 
                 embed_time_a = time.perf_counter()
-
-                print_message("Starting to embed payload")
                 proc.embed_payload(payload, tmp_output_image)
-
                 embed_time_b = time.perf_counter()
                 embed_time = round(embed_time_b - embed_time_a, 4)
 
-                proc2 = type(proc)(tmp_output_image)
+
+                logger.info("Testing %s extract on image %s with payload %s" % (method, tmp_output_img_filename, payload_filename))
+                proc2 = type(proc)("test/" + method + "_" + src_img_filename)
 
                 extract_time_a = time.perf_counter()
-            
-                print_message("Starting to extract payload")
                 proc2.extract_payload(tmp_payload_output_path)
-
                 extract_time_b = time.perf_counter()
                 extract_time = round(extract_time_b - extract_time_a, 4)
 
-                print_message("Starting to compare original and modified images for PSNR and SSIM")
                 proc.compare(proc2)
 
                 results.append(
@@ -77,15 +75,6 @@ def main():
                 )
                 i += 1
 
-                print_message("PROGRESS: %d/%d (%s%%)" % (i, total_iterations, str(round((i / total_iterations) * 100, 2))))
+                logger.info("Overall Progress: %d/%d (%s%%)" % (i, total_iterations, str(round((i / total_iterations) * 100, 2))))
 
-    
-    
     print(tabulate.tabulate(results, headers=["Source Image", "Method", "Payload", "Embed Time", "Extract Time", "Max Payload Size", "PSNR", "SSIM"]))
-    
-def print_message(message):
-    date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print("[%s] - %s" % (date_str, message))
-
-if __name__ == "__main__":
-    main()

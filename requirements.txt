@@ -1,0 +1,6 @@
+imutils==0.5.3
+numpy==1.18.2
+opencv-python==4.4.0.42
+scikit-image==0.17.2
+tabulate==0.8.7
+tqdm==4.51.0

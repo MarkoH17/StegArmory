@@ -52,7 +52,7 @@ def test():
 
 
                 logger.info("Testing %s extract on image %s with payload %s" % (method, tmp_output_img_filename, payload_filename))
-                proc2 = type(proc)("test/" + method + "_" + src_img_filename)
+                proc2 = type(proc)(tmp_output_image)
 
                 extract_time_a = time.perf_counter()
                 proc2.extract_payload(tmp_payload_output_path)

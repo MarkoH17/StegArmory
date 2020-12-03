@@ -494,7 +494,7 @@ class PVDProcessor(Processor):
         enc_pixels = self._pvd_embed(self.src_img_pixels, complete_payload)
         global_save_img_from_pixels(self, enc_pixels, dst_image)
 
-    def extract_payload(self, payload_save_path):
+    def extract_payload(self, payload_save_path, xor_key):
         if self.header is None:
             self.logger.critical("Missing embedded header in image! Cannot extract payload.")
             sys.exit(1)

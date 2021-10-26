@@ -2,7 +2,7 @@
 StegArmory is an image-based steganography utility that can be used to embed and extract data from PNG images. StegArmory currently supports least significant bit (LSB) and pixel value differencing (PVD) encoding techniques. StegArmory was meant to embed and extract/execute shellcode payloads from images, though time-constraints didn't allow that feature of the project to be fully developed - this is left as an exercise for the user :)
 
 # Getting Started
-Grab the latest release and install the package requirements by running `pip3 -r requirements.txt`. Keep in mind StegArmory was built for Python 3.
+Grab the latest release and install the package requirements by running `pip3 install -r requirements.txt`. Keep in mind StegArmory was built for Python 3.
 
 The file `handler.py` contains the main method and sets up a bunch of logging gizmos at the start. It also contains a few examples of how to encode and extract data from PNG images using both the LSB and PVD methods. Here are those examples:
 
